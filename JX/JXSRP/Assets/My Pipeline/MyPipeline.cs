@@ -10,6 +10,22 @@ public class MyPipeline : RenderPipeline
 
     // 共用的commandBuffer可以减少内存使用
     CommandBuffer cameraBuffer = new CommandBuffer { name = "Render Camera" };
+
+    // unity的动态合批对mesh顶点数量有限制:300
+    DrawRendererFlags drawFlags;
+
+    public MyPipeline(bool dynamicBatching, bool instancing)
+    {
+        if(dynamicBatching)
+        {
+            drawFlags = DrawRendererFlags.EnableDynamicBatching;
+        }
+        if(instancing)
+        {
+            drawFlags |= DrawRendererFlags.EnableInstancing;
+        }
+    }
+
     public override void Render(ScriptableRenderContext renderContext, Camera[] cameras)
     {
         base.Render(renderContext, cameras);
@@ -69,8 +85,12 @@ public class MyPipeline : RenderPipeline
 
             // 绘制设置和过滤器设置
             var drawSettings = new DrawRendererSettings(camera, new ShaderPassName("SRPDefaultUnlit"));
+
             // 只绘制离摄像机最近的物体，减少overdraw，所以需要先进行排序
             drawSettings.sorting.flags = SortFlags.CommonOpaque;
+
+            // 动态合批
+            drawSettings.flags = drawFlags;
 
             var filterSettings = new FilterRenderersSettings(true);
 
@@ -114,12 +134,14 @@ public class MyPipeline : RenderPipeline
                 hideFlags = HideFlags.HideAndDontSave
             };
         }
-        var drawSettings = new DrawRendererSettings(camera, new ShaderPassName("ForwardBase"));
-        drawSettings.SetShaderPassName(1, new ShaderPassName("PrepassBase"));
-        drawSettings.SetShaderPassName(2, new ShaderPassName("Always"));
-        drawSettings.SetShaderPassName(3, new ShaderPassName("Vertex"));
-        drawSettings.SetShaderPassName(4, new ShaderPassName("VertexLMRGBM"));
-        drawSettings.SetShaderPassName(5, new ShaderPassName("VertexLM"));
+
+        // 这些都是unity内置光照模型
+        var drawSettings = new DrawRendererSettings(camera, new ShaderPassName("ForwardBase"));     // 前向
+        drawSettings.SetShaderPassName(1, new ShaderPassName("PrepassBase"));   // 延迟
+        drawSettings.SetShaderPassName(2, new ShaderPassName("Always"));        // 无论使用哪种路径，该Pass总是会被渲染，但不会计算任何光照
+        drawSettings.SetShaderPassName(3, new ShaderPassName("Vertex"));        // 顶点
+        drawSettings.SetShaderPassName(4, new ShaderPassName("VertexLMRGBM"));  // RGBM编码，PC和主机
+        drawSettings.SetShaderPassName(5, new ShaderPassName("VertexLM"));      // LDR编码，移动端
         // 进行材质覆盖，第二个参数是用于渲染的材质着色器的通道索引，errorMaterial只有一个通道
         drawSettings.SetOverrideMaterial(errorMaterial, 0);
 
