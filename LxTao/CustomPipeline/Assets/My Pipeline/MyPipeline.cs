@@ -10,6 +10,20 @@ public class MyPipeline : RenderPipeline {
     CullResults cull;
     Material errorMaterial;
 
+    DrawRendererFlags drawFlags;
+
+    public MyPipeline(bool dynamicBatching, bool instancing)
+    {
+        if (dynamicBatching)
+        {
+            drawFlags = DrawRendererFlags.EnableDynamicBatching;
+        }
+        if (instancing)
+        {
+            drawFlags |= DrawRendererFlags.EnableInstancing;
+        }
+    }
+
     public override void Render(ScriptableRenderContext renderContext, Camera[] cameras) {
         base.Render(renderContext, cameras);
         foreach (var camera in cameras) {
@@ -39,6 +53,7 @@ public class MyPipeline : RenderPipeline {
         context.ExecuteCommandBuffer(cameraBuffer);
         cameraBuffer.Clear();
         var drawSettings = new DrawRendererSettings(camera, new ShaderPassName("SRPDefaultUnlit"));
+        drawSettings.flags = drawFlags;
         drawSettings.sorting.flags = SortFlags.CommonOpaque;
         var filterSettings = new FilterRenderersSettings(true) {
             renderQueueRange = RenderQueueRange.opaque
