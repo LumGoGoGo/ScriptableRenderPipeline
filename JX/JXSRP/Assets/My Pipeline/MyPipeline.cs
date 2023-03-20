@@ -5,6 +5,18 @@ using Conditional = System.Diagnostics.ConditionalAttribute;
 
 public class MyPipeline : RenderPipeline
 {
+    const int maxVisibleLights = 4;
+
+    static int visibleLightColorId = Shader.PropertyToID("_VisibleLightColors");
+    static int visibleLightDirectionId = Shader.PropertyToID("_VisibleLightDirectionsOrPositions");
+    static int visibleLightAttenuationId = Shader.PropertyToID("_VisibleLightAttenuations");
+    static int visibleLightSpotDirectionsId = Shader.PropertyToID("_VisibleLightSpotDirections");
+
+    Vector4[] visibleLightColors = new Vector4[maxVisibleLights];
+    Vector4[] visibleLightDirectioansOrPositions = new Vector4[maxVisibleLights];
+    Vector4[] visibleLightAttenuations = new Vector4[maxVisibleLights];
+    Vector4[] visibleLightSpotDirections = new Vector4[maxVisibleLights];
+
     CullResults cull;
     Material errorMaterial;
 
@@ -16,6 +28,8 @@ public class MyPipeline : RenderPipeline
 
     public MyPipeline(bool dynamicBatching, bool instancing)
     {
+        // 保证灯光强度是线性的，默认是gamma空间的
+        GraphicsSettings.lightsUseLinearIntensity = true;
         if(dynamicBatching)
         {
             drawFlags = DrawRendererFlags.EnableDynamicBatching;
@@ -75,9 +89,17 @@ public class MyPipeline : RenderPipeline
             (clearFlags & CameraClearFlags.Color) != 0,
             Color.clear);
 
+        ConfigureLights();
+
         // 标记，更清晰的层次结构
         cameraBuffer.BeginSample("Render Camera");
         {
+            // 复制到GPU上
+            cameraBuffer.SetGlobalVectorArray(visibleLightColorId, visibleLightColors);
+            cameraBuffer.SetGlobalVectorArray(visibleLightDirectionId, visibleLightDirectioansOrPositions);
+            cameraBuffer.SetGlobalVectorArray(visibleLightAttenuationId, visibleLightAttenuations);
+            cameraBuffer.SetGlobalVectorArray(visibleLightSpotDirectionsId, visibleLightSpotDirections);
+
             // 不是立即执行的，而是将buffer复制到context的内部缓冲区
             context.ExecuteCommandBuffer(cameraBuffer);
             // clear而不是release
@@ -119,6 +141,64 @@ public class MyPipeline : RenderPipeline
         cameraBuffer.Clear();
 
         context.Submit();
+    }
+
+    void ConfigureLights()
+    {
+        int i = 0;
+        // 裁剪的过程，也可获得可见光
+        for (; i < cull.visibleLights.Count; i++)
+        {
+            if(i == maxVisibleLights)
+            {
+                break;
+            }
+
+            VisibleLight light = cull.visibleLights[i];
+            visibleLightColors[i] = light.finalColor;   // 已经乘过强度且处理过颜色空间的最终颜色
+            Vector4 attenuation = Vector4.zero;
+            attenuation.w = 1f;
+
+            if (light.lightType == LightType.Directional)
+            {
+                Vector4 v = light.localToWorld.GetColumn(2);    // z方向向量
+                v.x = -v.x;
+                v.y = -v.y;
+                v.z = -v.z;
+                visibleLightDirectioansOrPositions[i] = v;
+            }
+            else
+            {
+                visibleLightDirectioansOrPositions[i] = light.localToWorld.GetColumn(3);
+                attenuation.x = 1f / Mathf.Max(light.range * light.range, 0.00001f);
+
+                if(light.lightType == LightType.Spot)
+                {
+                    Vector4 v = light.localToWorld.GetColumn(2);    // z方向向量
+                    v.x = -v.x;
+                    v.y = -v.y;
+                    v.z = -v.z;
+                    visibleLightSpotDirections[i] = v;
+
+                    float outerRad = Mathf.Deg2Rad * 0.5f * light.spotAngle;
+                    float outerCos = Mathf.Cos(outerRad);
+                    float outerTan = Mathf.Tan(outerRad);
+                    float innerCos =
+                        Mathf.Cos(Mathf.Atan((46f / 64f) * outerTan));
+                    float angleRange = Mathf.Max(innerCos - outerCos, 0.001f);
+                    attenuation.z = 1f / angleRange;
+                    attenuation.w = -outerCos * attenuation.z;
+                }
+            }
+
+            visibleLightAttenuations[i] = attenuation;
+        }
+
+        // 当可见光的数量减少时，会发生另一件事。它们会保持可见状态，因为我们没有重置其数据。可以通过在可见光结束后继续循环遍历数组，清除所有未使用的光的颜色来解决此问题
+        for (; i < maxVisibleLights; i++)
+        {
+            visibleLightColors[i] = Color.clear;
+        }
     }
 
     // 开发版本中调用、执行编辑器编译时调用
