@@ -9,6 +9,7 @@ https://zhuanlan.zhihu.com/p/165140042
 3. Unity2018默认gamma空间，gamma和Linear的区别
 4. C# 成员函数的public override前缀
 5. "命令缓冲区要求资源以将其命令存储在Unity引擎的本机级别。"
+6. 步骤3.5，UI显示在场景窗口，效果应该长啥样
 
 Opaque 不透明
 
