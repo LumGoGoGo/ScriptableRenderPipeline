@@ -5,12 +5,13 @@ using Conditional = System.Diagnostics.ConditionalAttribute;
 
 public class MyPipeline : RenderPipeline
 {
-    const int maxVisibleLights = 4;
+    const int maxVisibleLights = 16;
 
     static int visibleLightColorId = Shader.PropertyToID("_VisibleLightColors");
     static int visibleLightDirectionId = Shader.PropertyToID("_VisibleLightDirectionsOrPositions");
     static int visibleLightAttenuationId = Shader.PropertyToID("_VisibleLightAttenuations");
     static int visibleLightSpotDirectionsId = Shader.PropertyToID("_VisibleLightSpotDirections");
+    static int lightIndicesOffsetAndCountId = Shader.PropertyToID("unity_LightIndicesOffsetAndCount");
 
     Vector4[] visibleLightColors = new Vector4[maxVisibleLights];
     Vector4[] visibleLightDirectioansOrPositions = new Vector4[maxVisibleLights];
@@ -89,7 +90,15 @@ public class MyPipeline : RenderPipeline
             (clearFlags & CameraClearFlags.Color) != 0,
             Color.clear);
 
-        ConfigureLights();
+        if (cull.visibleLights.Count > 0)
+        {
+            ConfigureLights();
+        }
+        else
+        {
+            // 手动清零
+            cameraBuffer.SetGlobalVector(lightIndicesOffsetAndCountId, Vector4.zero);
+        }
 
         // 标记，更清晰的层次结构
         cameraBuffer.BeginSample("Render Camera");
@@ -106,13 +115,23 @@ public class MyPipeline : RenderPipeline
             cameraBuffer.Clear();
 
             // 绘制设置和过滤器设置
-            var drawSettings = new DrawRendererSettings(camera, new ShaderPassName("SRPDefaultUnlit"));
+            var drawSettings = new DrawRendererSettings(camera, new ShaderPassName("SRPDefaultUnlit"))
+            {
+                // 动态合批
+                flags = drawFlags //,
+
+                // 如果可见光数量为0，会崩溃
+                //rendererConfiguration = RendererConfiguration.PerObjectLightIndices8
+            };
+
+            // 解决上面的问题
+            if(cull.visibleLights.Count > 0)
+            {
+                drawSettings.rendererConfiguration = RendererConfiguration.PerObjectLightIndices8;
+            }
 
             // 只绘制离摄像机最近的物体，减少overdraw，所以需要先进行排序
             drawSettings.sorting.flags = SortFlags.CommonOpaque;
-
-            // 动态合批
-            drawSettings.flags = drawFlags;
 
             var filterSettings = new FilterRenderersSettings(true);
 
@@ -143,11 +162,11 @@ public class MyPipeline : RenderPipeline
         context.Submit();
     }
 
+    // 物体受到的灯光数据不一致，会影响合批
     void ConfigureLights()
     {
-        int i = 0;
         // 裁剪的过程，也可获得可见光
-        for (; i < cull.visibleLights.Count; i++)
+        for (int i = 0; i < cull.visibleLights.Count; i++)
         {
             if(i == maxVisibleLights)
             {
@@ -195,9 +214,20 @@ public class MyPipeline : RenderPipeline
         }
 
         // 当可见光的数量减少时，会发生另一件事。它们会保持可见状态，因为我们没有重置其数据。可以通过在可见光结束后继续循环遍历数组，清除所有未使用的光的颜色来解决此问题
-        for (; i < maxVisibleLights; i++)
+        //for (; i < maxVisibleLights; i++)
+        //{
+        //    visibleLightColors[i] = Color.clear;
+        //}
+
+        // 超出索引的灯光设置为无效
+        if (cull.visibleLights.Count > maxVisibleLights)
         {
-            visibleLightColors[i] = Color.clear;
+            int[] lightIndices = cull.GetLightIndexMap();
+            for (int i = maxVisibleLights; i < cull.visibleLights.Count; i++)
+            {
+                lightIndices[i] = -1;
+            }
+            cull.SetLightIndexMap(lightIndices);
         }
     }
 

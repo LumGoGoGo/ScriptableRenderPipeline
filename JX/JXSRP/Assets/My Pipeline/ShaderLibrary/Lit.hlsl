@@ -14,10 +14,12 @@ CBUFFER_END
 
 CBUFFER_START(UnityPerDraw)
 	float4x4 unity_ObjectToWorld;
+	float4 unity_LightIndicesOffsetAndCount;	// y:影响对象的灯光数量
+	float4 unity_4LightIndices0, unity_4LightIndices1;	// 灯光会有重要性排序，所以主要处理0中的灯光
 CBUFFER_END
 
 // 暂时仅支持4个光源
-#define MAX_VISIBLE_LIGHTS 4
+#define MAX_VISIBLE_LIGHTS 16
 
 // 这个buffer需要外部指定进行传入
 CBUFFER_START(_LightBuffer)
@@ -83,6 +85,9 @@ struct VertexOutput
 	float4 clipPos : SV_POSITION;
 	float3 normal : TEXCOORD0;	// 一般自定义的选用TEXCOORD 内置的还有COLOR0 COLOR1等
 	float3 worldPos : TEXCOORD1;
+
+	// 后四个灯光逐顶点计算
+	float3 vertexLighting : TEXCOORD2;
 	// GPUInstance需要通过ID去索引
 	UNITY_VERTEX_INPUT_INSTANCE_ID
 };
@@ -102,6 +107,16 @@ VertexOutput LitPassVertex(VertexInput input)
 	// 法线从模型空间转世界空间，非等比缩放需要使用逆转置
 	output.normal = mul((float3x3)UNITY_MATRIX_M, input.normal);
 	output.worldPos = worldPos;
+
+	// 后四个灯光重要性不高，所以通过顶点着色器去计算，节省性能
+	output.vertexLighting = 0;
+	for(int i = 4; i < min(unity_LightIndicesOffsetAndCount.y, 8); i++)
+	{
+		int lightIndex = unity_4LightIndices1[i - 4];
+		// 计算每个灯光的漫反射
+		output.vertexLighting += DiffuseLight(lightIndex, output.normal, output.worldPos);
+	}
+
 	return output;
 }
 
@@ -113,12 +128,14 @@ float4 LitPassFragment(VertexOutput input) : SV_TARGET
 	// 必须通过UNITY_ACCESS_INSTANCED_PROP宏对其进行访问，并将其传递给我们的缓冲区和属性名称
 	float3 albedo = UNITY_ACCESS_INSTANCED_PROP(PerInstance, _Color).rgb;
 
-	float3 diffuseLight = 0;
-	for(int i = 0; i < MAX_VISIBLE_LIGHTS; i++)
+	float3 diffuseLight = input.vertexLighting;
+	for(int i = 0; i < min(unity_LightIndicesOffsetAndCount.y, 4); i++)
 	{
+		int lightIndex = unity_4LightIndices0[i];
 		// 计算每个灯光的漫反射
-		diffuseLight += DiffuseLight(i, input.normal, input.worldPos);
+		diffuseLight += DiffuseLight(lightIndex, input.normal, input.worldPos);
 	}
+
 	float3 color = diffuseLight * albedo;
 	return float4(color, 1.0);
 }
