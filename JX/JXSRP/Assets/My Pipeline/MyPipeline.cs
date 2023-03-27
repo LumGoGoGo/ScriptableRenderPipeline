@@ -13,6 +13,25 @@ public class MyPipeline : RenderPipeline
     static int visibleLightSpotDirectionsId = Shader.PropertyToID("_VisibleLightSpotDirections");
     static int lightIndicesOffsetAndCountId = Shader.PropertyToID("unity_LightIndicesOffsetAndCount");
 
+    static int shadowMapId = Shader.PropertyToID("_ShadowMap");
+    //static int worldToShadowMatrixId = Shader.PropertyToID("_WorldToShadowMatrix");
+    static int worldToShadowMatricesId = Shader.PropertyToID("_WorldToShadowMatrices");
+    static int shadowBiasId = Shader.PropertyToID("_ShadowBias");
+    //static int shadowStrengthId = Shader.PropertyToID("_ShadowStrength");
+    static int shadowDataId = Shader.PropertyToID("_ShadowData");
+    static int shadowMapSizeId = Shader.PropertyToID("_ShadowMapSize");
+
+    const string ShadowsHardKeyword = "_SHADOWS_HARD";
+    const string ShadowsSoftKeyword = "_SHADOWS_SOFT";
+
+    RenderTexture shadowMap;
+    int shadowMapSize;
+
+    int shadowTileCount;
+
+    Vector4[] shadowData = new Vector4[maxVisibleLights];
+    Matrix4x4[] worldToShadowMatrices = new Matrix4x4[maxVisibleLights];
+
     Vector4[] visibleLightColors = new Vector4[maxVisibleLights];
     Vector4[] visibleLightDirectioansOrPositions = new Vector4[maxVisibleLights];
     Vector4[] visibleLightAttenuations = new Vector4[maxVisibleLights];
@@ -24,10 +43,13 @@ public class MyPipeline : RenderPipeline
     // 共用的commandBuffer可以减少内存使用
     CommandBuffer cameraBuffer = new CommandBuffer { name = "Render Camera" };
 
+    // 阴影使用单独的命令缓冲区
+    CommandBuffer shadowBuffer = new CommandBuffer { name = "Render Shadows" };
+
     // unity的动态合批对mesh顶点数量有限制:300
     DrawRendererFlags drawFlags;
 
-    public MyPipeline(bool dynamicBatching, bool instancing)
+    public MyPipeline(bool dynamicBatching, bool instancing, int shadowMapSize)
     {
         // 保证灯光强度是线性的，默认是gamma空间的
         GraphicsSettings.lightsUseLinearIntensity = true;
@@ -39,6 +61,7 @@ public class MyPipeline : RenderPipeline
         {
             drawFlags |= DrawRendererFlags.EnableInstancing;
         }
+        this.shadowMapSize = shadowMapSize;
     }
 
     public override void Render(ScriptableRenderContext renderContext, Camera[] cameras)
@@ -79,6 +102,21 @@ public class MyPipeline : RenderPipeline
         // 对于大对象，尽量使用ref
         CullResults.Cull(ref cullingParameters, context, ref cull);
 
+        if (cull.visibleLights.Count > 0)
+        {
+            ConfigureLights();
+
+            // 阴影将在设置摄像机之前剔除之后渲染
+            RenderShadows(context);
+        }
+        else
+        {
+            // 手动清零
+            cameraBuffer.SetGlobalVector(lightIndicesOffsetAndCountId, Vector4.zero);
+            cameraBuffer.DisableShaderKeyword(ShadowsHardKeyword);
+            cameraBuffer.DisableShaderKeyword(ShadowsSoftKeyword);
+        }
+
         // 将摄像机属性应用于context，例如设置矩阵等等
         context.SetupCameraProperties(camera);
 
@@ -89,16 +127,6 @@ public class MyPipeline : RenderPipeline
             (clearFlags & CameraClearFlags.Depth) != 0,
             (clearFlags & CameraClearFlags.Color) != 0,
             Color.clear);
-
-        if (cull.visibleLights.Count > 0)
-        {
-            ConfigureLights();
-        }
-        else
-        {
-            // 手动清零
-            cameraBuffer.SetGlobalVector(lightIndicesOffsetAndCountId, Vector4.zero);
-        }
 
         // 标记，更清晰的层次结构
         cameraBuffer.BeginSample("Render Camera");
@@ -160,11 +188,19 @@ public class MyPipeline : RenderPipeline
         cameraBuffer.Clear();
 
         context.Submit();
+
+        if(shadowMap)
+        {
+            // release
+            RenderTexture.ReleaseTemporary(shadowMap);
+            shadowMap = null;
+        }
     }
 
     // 物体受到的灯光数据不一致，会影响合批
     void ConfigureLights()
     {
+        shadowTileCount = 0;
         // 裁剪的过程，也可获得可见光
         for (int i = 0; i < cull.visibleLights.Count; i++)
         {
@@ -177,6 +213,7 @@ public class MyPipeline : RenderPipeline
             visibleLightColors[i] = light.finalColor;   // 已经乘过强度且处理过颜色空间的最终颜色
             Vector4 attenuation = Vector4.zero;
             attenuation.w = 1f;
+            Vector4 shadow = Vector4.zero;
 
             if (light.lightType == LightType.Directional)
             {
@@ -207,10 +244,21 @@ public class MyPipeline : RenderPipeline
                     float angleRange = Mathf.Max(innerCos - outerCos, 0.001f);
                     attenuation.z = 1f / angleRange;
                     attenuation.w = -outerCos * attenuation.z;
+
+                    Light shadowLight = light.light;
+                    Bounds shadowBounds;
+                    if(shadowLight.shadows != LightShadows.None && 
+                        cull.GetShadowCasterBounds(i, out shadowBounds))    // 检查该光源的阴影体积是否在一个有效的范围内
+                    {
+                        shadowTileCount += 1;
+                        shadow.x = shadowLight.shadowStrength;
+                        shadow.y = shadowLight.shadows == LightShadows.Soft ? 1.0f : 0.0f;
+                    }
                 }
             }
 
             visibleLightAttenuations[i] = attenuation;
+            shadowData[i] = shadow;
         }
 
         // 当可见光的数量减少时，会发生另一件事。它们会保持可见状态，因为我们没有重置其数据。可以通过在可见光结束后继续循环遍历数组，清除所有未使用的光的颜色来解决此问题
@@ -258,5 +306,143 @@ public class MyPipeline : RenderPipeline
         var filterSettings = new FilterRenderersSettings(true);
 
         context.DrawRenderers(cull.visibleRenderers, ref drawSettings, filterSettings);
+    }
+
+    void RenderShadows(ScriptableRenderContext context)
+    {
+        int split;
+        if(shadowTileCount <= 1)
+        {
+            split = 1;
+        }
+        else if(shadowTileCount <= 4)
+        {
+            split = 2;
+        }
+        else if (shadowTileCount <= 9)
+        {
+            split = 3;
+        }
+        else
+        {
+            split = 4;
+        }
+
+        float tileSize = shadowMapSize / split;
+        float tileScale = 1f / split;
+        Rect tileViewport = new Rect(0f, 0f, tileSize, tileSize);
+
+        shadowMap = RenderTexture.GetTemporary(shadowMapSize, shadowMapSize, 16, RenderTextureFormat.Shadowmap);    // 16位高精度
+
+        // 插值方式和环绕方式
+        shadowMap.filterMode = FilterMode.Bilinear;
+        shadowMap.wrapMode = TextureWrapMode.Clamp;
+
+        // 告诉GPU渲染到阴影贴图上
+        CoreUtils.SetRenderTarget(shadowBuffer, shadowMap,
+            RenderBufferLoadAction.DontCare, RenderBufferStoreAction.Store, // 1、绘制是完全不在乎之前的内容的 2、需要RT从tile memory 复制到 local memory，因为后续还需要采样这个纹理
+            ClearFlag.Depth);    // 只关心depth
+
+        shadowBuffer.BeginSample("Render Shadows");
+        context.ExecuteCommandBuffer(shadowBuffer);
+        shadowBuffer.Clear();
+
+        int tileIndex = 0;
+        bool hardShadows = false;
+        bool softShadows = false;
+        for (int i = 0; i < cull.visibleLights.Count; i++)
+        {
+            if(i == maxVisibleLights)
+            {
+                break;
+            }
+            
+            if(shadowData[i].x < 0.0f)
+            {
+                continue;
+            }
+
+            // 原理就是把光源当做摄像机，拍下深度
+            Matrix4x4 viewMatrix, projectionMatrix;
+            ShadowSplitData splitData;
+            if(!cull.ComputeSpotShadowMatricesAndCullingPrimitives(i, out viewMatrix, out projectionMatrix, out splitData))
+            {
+                shadowData[i].x = 0.0f;
+                continue;
+            }
+
+            float tileOffsetX = tileIndex % split;
+            float tileOffsetY = tileIndex / split;
+            tileViewport.x = tileOffsetX * tileSize;
+            tileViewport.y = tileOffsetY * tileSize;
+
+            shadowBuffer.SetViewport(tileViewport);
+            shadowBuffer.EnableScissorRect(new Rect(tileViewport.x + 4f, tileViewport.y + 4f, tileSize - 8f, tileSize - 8f));
+            shadowBuffer.SetViewProjectionMatrices(viewMatrix, projectionMatrix);
+            // 偏移，解决自阴影
+            shadowBuffer.SetGlobalFloat(shadowBiasId, cull.visibleLights[0].light.shadowBias);
+            context.ExecuteCommandBuffer(shadowBuffer);
+            shadowBuffer.Clear();
+
+            var shadowSettings = new DrawShadowsSettings(cull, i);
+            context.DrawShadows(ref shadowSettings);
+            if (SystemInfo.usesReversedZBuffer)
+            {
+                projectionMatrix.m20 = -projectionMatrix.m20;
+                projectionMatrix.m21 = -projectionMatrix.m21;
+                projectionMatrix.m22 = -projectionMatrix.m22;
+                projectionMatrix.m23 = -projectionMatrix.m23;
+            }
+            // 裁剪空间是-1到1，纹理坐标是0到1，需要偏移一下
+            //var scaleOffset = Matrix4x4.TRS(Vector3.one * 0.5f, Quaternion.identity, Vector3.one * 0.5f);
+            var scaleOffset = Matrix4x4.identity;
+            scaleOffset.m00 = scaleOffset.m11 = scaleOffset.m22 = 0.5f;
+            scaleOffset.m03 = scaleOffset.m13 = scaleOffset.m23 = 0.5f;
+
+            worldToShadowMatrices[i] = scaleOffset * (projectionMatrix * viewMatrix);
+
+            var tileMatrix = Matrix4x4.identity;
+            tileMatrix.m00 = tileMatrix.m11 = tileScale;
+            tileMatrix.m03 = tileOffsetX * tileScale;
+            tileMatrix.m13 = tileOffsetY * tileScale;
+            worldToShadowMatrices[i] = tileMatrix * worldToShadowMatrices[i];
+
+            if(shadowData[i].y <= 0f)
+            {
+                hardShadows = true;
+            }
+            else
+            {
+                softShadows = true;
+            }
+
+            tileIndex += 1;
+        }
+
+        // 以免影响到其他渲染流程
+        shadowBuffer.DisableScissorRect();
+        shadowBuffer.SetGlobalTexture(shadowMapId, shadowMap);
+        shadowBuffer.SetGlobalMatrixArray(worldToShadowMatricesId, worldToShadowMatrices);
+        //shadowBuffer.SetGlobalFloat(shadowStrengthId, cull.visibleLights[0].light.shadowStrength);
+        shadowBuffer.SetGlobalVectorArray(shadowDataId, shadowData);
+
+        float invShadowMapSize = 1f / shadowMapSize;
+        shadowBuffer.SetGlobalVector(shadowMapSizeId, new Vector4(invShadowMapSize, invShadowMapSize, shadowMapSize, shadowMapSize)); // 宽倒数，高倒数，宽，高
+
+        //if(cull.visibleLights[0].light.shadows == LightShadows.Soft)
+        //{
+        //    shadowBuffer.EnableShaderKeyword(ShadowsSoftKeyword);
+        //}
+        //else
+        //{
+        //    shadowBuffer.DisableShaderKeyword(ShadowsSoftKeyword);
+        //}
+        CoreUtils.SetKeyword(shadowBuffer, ShadowsHardKeyword, hardShadows);
+        CoreUtils.SetKeyword(shadowBuffer, ShadowsSoftKeyword, softShadows);
+
+        shadowBuffer.EndSample("Render Shadows");
+        // 还需提交清理命令
+        context.ExecuteCommandBuffer(shadowBuffer);
+        shadowBuffer.Clear();
     }
 }
