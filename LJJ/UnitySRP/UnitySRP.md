@@ -1,4 +1,5 @@
 https://zhuanlan.zhihu.com/p/165140042
+原文：https://catlikecoding.com/unity/tutorials/scriptable-render-pipeline/
 
 # 一
 
@@ -22,3 +23,14 @@ Opaque 不透明
 说明
 
 - 用FilterRenderersSettings而不用FilterRendererSettings，可能因为写教程时没有不带s的，用2018.3.0f2没有不带s的
+
+# 二
+
+问题
+
+1. float4第四部分为1时，明确表示后的优化做了什么？（Unity自己做的优化）差一条命令mad和add
+
+点
+
+- 创建shader文件，用来描述pass的输入输出及每个pass的shader代码。
+- shader文件通过include引入shader代码，对应vs和ps程序。
